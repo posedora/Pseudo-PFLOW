@@ -47,6 +47,7 @@ import java.io.*;
 import java.util.*;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
@@ -80,6 +81,19 @@ public class TripGenerator_WebAPI_refactor {
 	private final String transportCode;
 	private final String transitSelection;
 	private final double transferPenalty;
+
+	// Tour-based mode choice and extra car cost for target prefectures
+	// (docs/TOUR_MODE_CHOICE_DESIGN_ja.md). All default to off = legacy behaviour.
+	private final boolean tourEnabled;
+	private final boolean carAvailPerPerson;
+	private final Set<String> extraCostPrefs;
+	private final double extraParking;
+	private final double extraDelayPerTrip;
+	private final boolean costLogEnabled;
+	private final ConcurrentLinkedQueue<String> costLogRows = new ConcurrentLinkedQueue<>();
+	private final AtomicInteger tourSimpleCount = new AtomicInteger();
+	private final AtomicInteger tourComplexCount = new AtomicInteger();
+	private final AtomicInteger modeChangedCount = new AtomicInteger();
 
 	// Mixed-route diagnostic counters (shared across TripTask threads)
 	private final AtomicInteger mixedQueryCount = new AtomicInteger();
@@ -143,6 +157,15 @@ public class TripGenerator_WebAPI_refactor {
 			throw new IllegalArgumentException("api.transit.selection must be one of: generalized_cost, min_time, min_fare, min_transfers; got: " + transitSelection);
 		}
 		this.transferPenalty = Double.parseDouble(prop.getProperty("api.transit.transferPenalty", "0"));
+		this.tourEnabled = Boolean.parseBoolean(prop.getProperty("tour.enabled", "false"));
+		this.carAvailPerPerson = Boolean.parseBoolean(prop.getProperty("car.availability.perPerson", "false"));
+		this.extraCostPrefs = new HashSet<>();
+		for (String p : prop.getProperty("car.extraCost.targetPrefs", "13").split(",")) {
+			if (!p.trim().isEmpty()) this.extraCostPrefs.add(String.format("%02d", Integer.parseInt(p.trim())));
+		}
+		this.extraParking = Double.parseDouble(prop.getProperty("car.extraCost.parking", "0"));
+		this.extraDelayPerTrip = Double.parseDouble(prop.getProperty("car.extraCost.delayPerTrip", "0"));
+		this.costLogEnabled = Boolean.parseBoolean(prop.getProperty("debug.costLog", "false"));
 		this.transitStops = transitStops;
 		this.precheckRadius = Double.parseDouble(maxRadius);
 		this.routeCacheMaxEntries = Integer.parseInt(
@@ -377,16 +400,36 @@ public class TripGenerator_WebAPI_refactor {
 			calendar.set(Calendar.MONTH, Calendar.OCTOBER);
 		}
 
+		/** Legacy entry point: evaluate all modes and pick the cheapest for a single trip. */
 		private ETransport determineTransportMode(Person person, double distance, Route route, Map<String, String> mixedparams, JsonNode[] mixedResultsHolder){
-			ETransport nextMode;
+			return chooseMin(evaluateOptions(person, null, distance, route, mixedparams, mixedResultsHolder));
+		}
 
+		/** Mode with the lowest generalized cost (ties: first inserted, as before). */
+		private ETransport chooseMin(Map<ETransport, Double> choices) {
+			return choices.entrySet()
+					.stream()
+					.min(Comparator.comparing(Map.Entry::getValue))
+					.map(Map.Entry::getKey)
+					.orElse(ETransport.NOT_DEFINED);
+		}
+
+		/**
+		 * Generalized cost (yen) of every available mode for one trip, without choosing.
+		 * The body is the former determineTransportMode() minus the final min selection.
+		 *
+		 * @param carAvailable null = draw car availability per trip (legacy behaviour);
+		 *                     otherwise the availability already drawn once for this person.
+		 */
+		private Map<ETransport, Double> evaluateOptions(Person person, Boolean carAvailable, double distance, Route route, Map<String, String> mixedparams, JsonNode[] mixedResultsHolder){
 			Map<ETransport, Double> choices = new LinkedHashMap<>();
 
 			if(route!=null){
 				double roadtime = route.getCost(); // seconds
 				double roadfare = FARE_INIT + route.getLength() / 1000 * FARE_PER_KILOMETER; // length in meters, 150 as initial cost to avoid short distance car travel
 				double roadcost = roadfare + roadtime / 3600 * FARE_PER_HOUR;
-				if(person.hasCar() || getRandom() < CAR_AVAILABILITY){
+				boolean car = (carAvailable != null) ? carAvailable : (person.hasCar() || getRandom() < CAR_AVAILABILITY);
+				if(car){
 					choices.put(ETransport.CAR, roadcost);
 				}
 
@@ -475,17 +518,7 @@ public class TripGenerator_WebAPI_refactor {
 				mixedBelowDistThreshold.incrementAndGet();
 			}
 
-			nextMode = choices.entrySet()
-					.stream()
-					.min(Comparator.comparing(Map.Entry::getValue))
-					.map(Map.Entry::getKey)
-					.orElse(ETransport.NOT_DEFINED);
-
-			if (nextMode == ETransport.MIX) {
-				mixedSelectedCount.incrementAndGet();
-			}
-
-			return nextMode;
+			return choices;
 		}
 
 		private JsonNode selectBestTransitCandidate(List<JsonNode> candidates) {
@@ -816,96 +849,28 @@ public class TripGenerator_WebAPI_refactor {
 					points.add(new SPoint(pre.getLocation().getLon(), pre.getLocation().getLat(), endDate, ETransport.NOT_DEFINED, EPurpose.HOME));
 					person.addTrajectory(points);
 				} else {
+					// Car availability: legacy = drawn per trip inside evaluateOptions (null);
+					// tour mode or car.availability.perPerson = drawn once per person for the day.
+					Boolean carToday = (tourEnabled || carAvailPerPerson)
+							? Boolean.valueOf(person.hasCar() || getRandom() < CAR_AVAILABILITY) : null;
+
+					// (1) generalized cost of every mode for every trip of the day
+					List<Leg> legs = new ArrayList<>();
 					for (int i = 1; i < activities.size(); i++) {
-						List<SPoint> subpoints = new ArrayList<>();
-
-						Activity next = activities.get(i);
-						GLonLat oll = pre.getLocation();
-						GLonLat dll = next.getLocation();
-
-						long startTime = next.getStartTime();
-						long endTime = startTime;
-
-						EPurpose purpose = next.getPurpose();
-						double distance = DistanceUtils.distance(oll, dll);
-
-						int currentTripId = ++tripCounter;
-
-						if (distance > 0) {
-							ETransport nextMode;
-							Map<String, String> mixedparams = getStringStringMap(oll, dll, startTime);
-
-							JsonNode[] mixedResultsHolder = new JsonNode[1];
-
-							Route route = routing.getRoute(drm, oll.getLon(), oll.getLat(), dll.getLon(), dll.getLat());
-							nextMode = determineTransportMode(person, distance, route, mixedparams, mixedResultsHolder);
-
-							int multiplier = calculateMultiplier(nextMode);
-							long travelTime = 0;
-
-							if (nextMode == ETransport.WALK || nextMode == ETransport.BICYCLE || nextMode == ETransport.CAR) {
-								travelTime = calculateTravelTime(route, multiplier);
-								endTime += travelTime;
-
-								List<Node> nodes = route.listNodes();
-								Map<Node, Date> timeMap = TrajectoryUtils.putTimeStamp(nodes, new Date(startTime * 1000), new Date(endTime * 1000));
-								addSubpoints(nodes, timeMap, nextMode, purpose, subpoints);
-
-								List<Link> links = route.listLinks();
-								assignLinksToSubpoints(subpoints, links);
-								points.addAll(subpoints);
-
-								long depTime = next.getStartTime() - travelTime;
-								Trip trip = new Trip(nextMode, purpose, depTime, oll, dll);
-								trip.setTripId(currentTripId);
-								trip.setSubtripId(0);
-								person.addTrip(trip);
-							} else if (nextMode == ETransport.MIX) {
-								if (mixedResultsHolder[0].path("features").get(0) == null) {
-									System.out.println("empty mixed results!");
-								}
-								List<Trip> mixedTrips = handleMixedTransport(nextMode, purpose, mixedResultsHolder, subpoints, points, next, route, startTime, endTime, oll, dll);
-
-								// Assign tripId, subtripId, and compute repMode for mixed subtrips
-								ETransport repMode = ETransport.NOT_DEFINED;
-								for (int s = 0; s < mixedTrips.size(); s++) {
-									Trip t = mixedTrips.get(s);
-									t.setTripId(currentTripId);
-									t.setSubtripId(s);
-									repMode = Trip.computeRepMode(repMode, t.getTransport());
-								}
-								for (Trip t : mixedTrips) {
-									t.setRepMode(repMode);
-									person.addTrip(t);
-								}
-							} else {
-								Trip trip = new Trip(ETransport.NOT_DEFINED, next.getPurpose(), next.getStartTime(), pre.getLocation(), pre.getLocation());
-								trip.setTripId(currentTripId);
-								trip.setSubtripId(0);
-								person.addTrip(trip);
-								Calendar cl = Calendar.getInstance();
-								Date startDate = new Date(next.getStartTime());
-								configureCalendar(cl, startDate);
-								startDate = cl.getTime();
-								points.add(new SPoint(pre.getLocation().getLon(), pre.getLocation().getLat(), startDate, ETransport.NOT_DEFINED, EPurpose.HOME));
-								Date endDate = new Date(next.getStartTime() + 300);
-								configureCalendar(cl, endDate);
-								endDate = cl.getTime();
-								points.add(new SPoint(pre.getLocation().getLon(), pre.getLocation().getLat(), endDate, ETransport.NOT_DEFINED, EPurpose.HOME));
-							}
-						} else {
-							Trip trip = new Trip(ETransport.NOT_DEFINED, next.getPurpose(), next.getStartTime(), pre.getLocation(), pre.getLocation());
-							trip.setTripId(currentTripId);
-							trip.setSubtripId(0);
-							person.addTrip(trip);
-							Calendar cl = Calendar.getInstance();
-							Date startDate = new Date(next.getStartTime());
-							configureCalendar(cl, startDate);
-							startDate = cl.getTime();
-							points.add(new SPoint(pre.getLocation().getLon(), pre.getLocation().getLat(), startDate, ETransport.NOT_DEFINED, next.getPurpose()));
-						}
-
-						pre = next;
+						legs.add(evaluateLeg(person, activities.get(i - 1), activities.get(i), carToday));
+					}
+					// (2) mode decision: trip by trip (legacy) or tour by tour
+					if (tourEnabled) {
+						decideByTour(legs);
+					} else {
+						decideByTrip(legs);
+					}
+					// (3) trips and trajectory with the decided modes
+					for (Leg leg : legs) {
+						buildLeg(person, leg, points);
+					}
+					if (costLogEnabled) {
+						logLegs(person, legs);
 					}
 				}
 				person.addTrajectory(points);
@@ -914,6 +879,239 @@ public class TripGenerator_WebAPI_refactor {
 			}
 
 			return 0;
+		}
+
+		/** Step (1): route, costs of every mode and target-prefecture flags for one trip. */
+		private Leg evaluateLeg(Person person, Activity pre, Activity next, Boolean carToday) {
+			Leg leg = new Leg(pre, next, ++tripCounter);
+			leg.distance = DistanceUtils.distance(pre.getLocation(), next.getLocation());
+			if (leg.distance > 0) {
+				GLonLat oll = pre.getLocation();
+				GLonLat dll = next.getLocation();
+				Map<String, String> mixedparams = getStringStringMap(oll, dll, next.getStartTime());
+				leg.route = routing.getRoute(drm, oll.getLon(), oll.getLat(), dll.getLon(), dll.getLat());
+				leg.costs = evaluateOptions(person, carToday, leg.distance, leg.route, mixedparams, leg.transit);
+				leg.baseline = chooseMin(leg.costs);
+				leg.origTarget = inTargetPref(pre.getGcode());
+				leg.destTarget = inTargetPref(next.getGcode());
+			}
+			return leg;
+		}
+
+		private boolean inTargetPref(String gcode) {
+			if (gcode == null || extraCostPrefs.isEmpty()) return false;
+			String g = gcode.trim();
+			if (g.length() == 4) g = "0" + g;  // prefectures 1-9 without a leading zero
+			return g.length() >= 2 && extraCostPrefs.contains(g.substring(0, 2));
+		}
+
+		/** Extra cost for the car option of one trip: parking when arriving in a target prefecture, delay when entering or leaving it. */
+		private double tripExtraCost(Leg leg, boolean chargeParking) {
+			double extra = 0;
+			if (chargeParking && leg.destTarget) extra += extraParking;
+			if (leg.origTarget || leg.destTarget) extra += extraDelayPerTrip;
+			return extra;
+		}
+
+		private Map<ETransport, Double> withCarExtra(Map<ETransport, Double> costs, double extra) {
+			Map<ETransport, Double> c = new LinkedHashMap<>(costs);
+			if (extra > 0 && c.containsKey(ETransport.CAR)) {
+				c.put(ETransport.CAR, c.get(ETransport.CAR) + extra);
+			}
+			return c;
+		}
+
+		/** Step (2), legacy: the cheapest mode trip by trip (identical to before when no extra cost is set). */
+		private void decideByTrip(List<Leg> legs) {
+			for (Leg leg : legs) {
+				if (leg.distance <= 0) continue;
+				leg.mode = chooseMin(withCarExtra(leg.costs, tripExtraCost(leg, true)));
+				leg.tourType = "trip";
+			}
+		}
+
+		/** Step (2), tour mode: split the day into tours (a tour ends on returning home) and decide each. */
+		private void decideByTour(List<Leg> legs) {
+			List<Leg> tour = new ArrayList<>();
+			for (Leg leg : legs) {
+				tour.add(leg);
+				if (leg.next.getPurpose() == EPurpose.HOME) {
+					decideTour(tour);
+					tour = new ArrayList<>();
+				}
+			}
+			if (!tour.isEmpty()) decideTour(tour);
+		}
+
+		/**
+		 * Simple round trip (home -> A -> home, two moving trips): one mode for both ways, chosen by the
+		 * round-trip cost. A car tour touching a target prefecture pays parking once and the delay cost
+		 * for every trip that enters or leaves the target.
+		 * Other tours: trip by trip, but the car is only usable if the person left home by car, and a
+		 * person who left by car goes back home by car. (Forcing one mode on every trip of a longer tour
+		 * would make e.g. a 300 m lunch trip decide a 30 km commute.)
+		 */
+		private void decideTour(List<Leg> tour) {
+			List<Leg> moving = new ArrayList<>();
+			for (Leg l : tour) {
+				if (l.distance > 0) moving.add(l);
+			}
+			if (moving.isEmpty()) return;
+
+			int nTarget = 0;
+			for (Leg l : moving) {
+				if (l.origTarget || l.destTarget) nTarget++;
+			}
+			boolean returnsHome = tour.get(tour.size() - 1).next.getPurpose() == EPurpose.HOME;
+
+			if (moving.size() == 2 && returnsHome) {
+				Leg out = moving.get(0);
+				Leg back = moving.get(1);
+				ETransport best = ETransport.NOT_DEFINED;
+				double bestCost = Double.MAX_VALUE;
+				for (ETransport m : TOUR_MODES) {
+					if (!out.costs.containsKey(m) || !back.costs.containsKey(m)) continue;
+					double c = out.costs.get(m) + back.costs.get(m);
+					if (m == ETransport.CAR && nTarget > 0) c += extraParking + extraDelayPerTrip * nTarget;
+					if (c < bestCost) {
+						bestCost = c;
+						best = m;
+					}
+				}
+				if (best != ETransport.NOT_DEFINED) {
+					out.mode = best;
+					back.mode = best;
+					out.tourType = "simple";
+					back.tourType = "simple";
+					tourSimpleCount.incrementAndGet();
+					return;
+				}
+			}
+
+			boolean carOut = false;
+			boolean parkingCharged = false;
+			for (int k = 0; k < moving.size(); k++) {
+				Leg l = moving.get(k);
+				Map<ETransport, Double> c = withCarExtra(l.costs, tripExtraCost(l, !parkingCharged));
+				if (k > 0 && !carOut) c.remove(ETransport.CAR);
+				boolean backHome = (l.next.getPurpose() == EPurpose.HOME);
+				l.mode = (carOut && backHome && c.containsKey(ETransport.CAR)) ? ETransport.CAR : chooseMin(c);
+				if (k == 0) carOut = (l.mode == ETransport.CAR);
+				if (l.mode == ETransport.CAR && l.destTarget) parkingCharged = true;
+				l.tourType = "complex";
+			}
+			tourComplexCount.incrementAndGet();
+		}
+
+		/** Step (3): trips and trajectory for one trip with its decided mode (the former loop body of process()). */
+		private void buildLeg(Person person, Leg leg, List<SPoint> points) {
+			Activity pre = leg.pre;
+			Activity next = leg.next;
+			GLonLat oll = pre.getLocation();
+			GLonLat dll = next.getLocation();
+			long startTime = next.getStartTime();
+			long endTime = startTime;
+			EPurpose purpose = next.getPurpose();
+			int currentTripId = leg.tripId;
+			List<SPoint> subpoints = new ArrayList<>();
+
+			if (leg.distance > 0) {
+				ETransport nextMode = leg.mode;
+				if (nextMode != leg.baseline) {
+					modeChangedCount.incrementAndGet();
+				}
+				Route route = leg.route;
+				JsonNode[] mixedResultsHolder = leg.transit;
+
+				int multiplier = calculateMultiplier(nextMode);
+				long travelTime = 0;
+
+				if (nextMode == ETransport.WALK || nextMode == ETransport.BICYCLE || nextMode == ETransport.CAR) {
+					travelTime = calculateTravelTime(route, multiplier);
+					endTime += travelTime;
+
+					List<Node> nodes = route.listNodes();
+					Map<Node, Date> timeMap = TrajectoryUtils.putTimeStamp(nodes, new Date(startTime * 1000), new Date(endTime * 1000));
+					addSubpoints(nodes, timeMap, nextMode, purpose, subpoints);
+
+					List<Link> links = route.listLinks();
+					assignLinksToSubpoints(subpoints, links);
+					points.addAll(subpoints);
+
+					long depTime = next.getStartTime() - travelTime;
+					Trip trip = new Trip(nextMode, purpose, depTime, oll, dll);
+					trip.setTripId(currentTripId);
+					trip.setSubtripId(0);
+					person.addTrip(trip);
+				} else if (nextMode == ETransport.MIX) {
+					mixedSelectedCount.incrementAndGet();
+					if (mixedResultsHolder[0].path("features").get(0) == null) {
+						System.out.println("empty mixed results!");
+					}
+					List<Trip> mixedTrips = handleMixedTransport(nextMode, purpose, mixedResultsHolder, subpoints, points, next, route, startTime, endTime, oll, dll);
+
+					// Assign tripId, subtripId, and compute repMode for mixed subtrips
+					ETransport repMode = ETransport.NOT_DEFINED;
+					for (int s = 0; s < mixedTrips.size(); s++) {
+						Trip t = mixedTrips.get(s);
+						t.setTripId(currentTripId);
+						t.setSubtripId(s);
+						repMode = Trip.computeRepMode(repMode, t.getTransport());
+					}
+					for (Trip t : mixedTrips) {
+						t.setRepMode(repMode);
+						person.addTrip(t);
+					}
+				} else {
+					Trip trip = new Trip(ETransport.NOT_DEFINED, next.getPurpose(), next.getStartTime(), pre.getLocation(), pre.getLocation());
+					trip.setTripId(currentTripId);
+					trip.setSubtripId(0);
+					person.addTrip(trip);
+					Calendar cl = Calendar.getInstance();
+					Date startDate = new Date(next.getStartTime());
+					configureCalendar(cl, startDate);
+					startDate = cl.getTime();
+					points.add(new SPoint(pre.getLocation().getLon(), pre.getLocation().getLat(), startDate, ETransport.NOT_DEFINED, EPurpose.HOME));
+					Date endDate = new Date(next.getStartTime() + 300);
+					configureCalendar(cl, endDate);
+					endDate = cl.getTime();
+					points.add(new SPoint(pre.getLocation().getLon(), pre.getLocation().getLat(), endDate, ETransport.NOT_DEFINED, EPurpose.HOME));
+				}
+			} else {
+				Trip trip = new Trip(ETransport.NOT_DEFINED, next.getPurpose(), next.getStartTime(), pre.getLocation(), pre.getLocation());
+				trip.setTripId(currentTripId);
+				trip.setSubtripId(0);
+				person.addTrip(trip);
+				Calendar cl = Calendar.getInstance();
+				Date startDate = new Date(next.getStartTime());
+				configureCalendar(cl, startDate);
+				startDate = cl.getTime();
+				points.add(new SPoint(pre.getLocation().getLon(), pre.getLocation().getLat(), startDate, ETransport.NOT_DEFINED, next.getPurpose()));
+			}
+		}
+
+		/** debug.costLog: one row per moving trip with the cost of every mode and the decision. */
+		private void logLegs(Person person, List<Leg> legs) {
+			for (Leg l : legs) {
+				if (l.distance <= 0) continue;
+				Map<ETransport, Double> c = l.costs;
+				EPurpose p = l.next.getPurpose();
+				costLogRows.add(String.join(",",
+						String.valueOf(person.getId()),
+						String.valueOf(l.tripId),
+						String.valueOf(l.pre.getGcode()),
+						String.valueOf(l.next.getGcode()),
+						p == null ? "" : String.valueOf(p.getId()),
+						String.format(Locale.ROOT, "%.0f", l.distance),
+						c.containsKey(ETransport.CAR) ? "1" : "0",
+						fmtCost(c.get(ETransport.CAR)),
+						fmtCost(c.get(ETransport.WALK)),
+						fmtCost(c.get(ETransport.BICYCLE)),
+						fmtCost(c.get(ETransport.MIX)),
+						l.baseline.name(),
+						l.mode.name(),
+						l.tourType));
+			}
 		}
 
 		private Map<String, String> getStringStringMap(GLonLat oll, GLonLat dll, long startTime) {
@@ -1470,6 +1668,9 @@ public class TripGenerator_WebAPI_refactor {
 						boolean append = (processed > 0);
 						PersonAccessor.writeTrips(tripFileName, batch, append);
 						PersonAccessor.writeTrajectory(trajectoryFileName, batch, append);
+						if (worker.costLogEnabled) {
+							worker.flushCostLog(outputDir + "costlog/" + i + "/costlog_" + cityCode + ".csv", append);
+						}
 
 						// Release trip + trajectory data immediately after writing
 						for (Person p : batch) {
@@ -1535,6 +1736,53 @@ public class TripGenerator_WebAPI_refactor {
 		return cityCode;
 	}
 
+	/** Mode order for tour decisions (same order as the legacy cost map, so ties resolve the same way). */
+	private static final ETransport[] TOUR_MODES = {ETransport.CAR, ETransport.WALK, ETransport.BICYCLE, ETransport.MIX};
+
+	/** One trip of a person's day: the cost of every mode first, the decided mode afterwards. */
+	private static final class Leg {
+		final Activity pre;
+		final Activity next;
+		final int tripId;
+		double distance;
+		Route route;
+		Map<ETransport, Double> costs = new LinkedHashMap<>();
+		final JsonNode[] transit = new JsonNode[1];
+		ETransport baseline = ETransport.NOT_DEFINED;  // cheapest per trip without extra cost
+		ETransport mode = ETransport.NOT_DEFINED;      // final decision
+		boolean origTarget;
+		boolean destTarget;
+		String tourType = "";
+
+		Leg(Activity pre, Activity next, int tripId) {
+			this.pre = pre;
+			this.next = next;
+			this.tripId = tripId;
+		}
+	}
+
+	private static String fmtCost(Double v) {
+		return v == null ? "" : String.format(Locale.ROOT, "%.1f", v);
+	}
+
+	/** Write and clear the cost-log rows collected during generate() (debug.costLog=true). */
+	public void flushCostLog(String fileName, boolean append) throws IOException {
+		File f = new File(fileName);
+		if (f.getParentFile() != null) f.getParentFile().mkdirs();
+		try (BufferedWriter bw = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(f, append), "UTF-8"))) {
+			if (!append) {
+				bw.write("person_id,trip_id,orig_gcode,dest_gcode,purpose,distance_m,car_avail,"
+						+ "cost_car,cost_walk,cost_bicycle,cost_mix,mode_baseline,mode_final,tour_type");
+				bw.newLine();
+			}
+			String row;
+			while ((row = costLogRows.poll()) != null) {
+				bw.write(row);
+				bw.newLine();
+			}
+		}
+	}
+
 	private static void printDiagnostics(TripGenerator_WebAPI_refactor worker, int pref, String groupKey) {
 		System.out.println("--- Mixed-route diagnostics (pref " + pref + ", group " + groupKey + ") ---");
 		System.out.println("  AppDate: " + worker.appDate + ", TransportCode: " + worker.transportCode + ", selection: " + worker.transitSelection);
@@ -1575,6 +1823,17 @@ public class TripGenerator_WebAPI_refactor {
 		System.out.println("  Retry after refresh failed: " + worker.sessionRetryFailCount.get());
 		long sessionAge = (System.currentTimeMillis() - worker.sessionCreatedAt) / 1000;
 		System.out.println("  Final session age: " + sessionAge + "s");
+		System.out.println("  --- Tour / extra car cost ---");
+		System.out.println("  tour.enabled=" + worker.tourEnabled
+			+ ", car.availability.perPerson=" + worker.carAvailPerPerson
+			+ ", targetPrefs=" + worker.extraCostPrefs
+			+ ", parking=" + worker.extraParking
+			+ ", delayPerTrip=" + worker.extraDelayPerTrip
+			+ ", costLog=" + worker.costLogEnabled);
+		System.out.println("  Simple round-trip tours decided jointly: " + worker.tourSimpleCount.get()
+			+ ", other tours (trip by trip, car consistency): " + worker.tourComplexCount.get());
+		System.out.println("  Trips whose final mode differs from the per-trip cheapest without extra cost: "
+			+ worker.modeChangedCount.get());
 		System.out.println("---");
 	}
 }
