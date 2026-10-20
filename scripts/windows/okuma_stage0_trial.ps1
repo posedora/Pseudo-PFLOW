@@ -19,6 +19,10 @@
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\scripts\windows\okuma_stage0_trial.ps1
     powershell -ExecutionPolicy Bypass -File .\scripts\windows\okuma_stage0_trial.ps1 -N 5000
+    powershell -ExecutionPolicy Bypass -File .\scripts\windows\okuma_stage0_trial.ps1 -PublicApi
+
+    -PublicApi uses the public WebAPI (pflow-api.csis.u-tokyo.ac.jp) instead of the
+    local one, and writes to <OutRoot>_public. Keep it to small trials.
 #>
 param(
     [int]$N = 1000,
@@ -27,10 +31,16 @@ param(
     [string]$City = "12217",
     [string]$OutRoot = "C:\okuma\out\stage0_trial",
     [string]$Ver3Root = "C:\Pseudo-PFLOW",
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    [switch]$PublicApi
 )
 
 $ErrorActionPreference = "Stop"
+$ApiBase = "http://localhost"
+if ($PublicApi) {
+    $ApiBase = "https://pflow-api.csis.u-tokyo.ac.jp"
+    $OutRoot = $OutRoot + "_public"
+}
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $ProjectDir = (Resolve-Path "$ScriptDir\..\..").Path
 $Pref = $City.Substring(0, 2).TrimStart("0")
@@ -51,6 +61,7 @@ foreach ($p in @($Ver3Project, $Ver3Activity, $Ver3Trip)) {
 Write-Host "project : $ProjectDir"
 Write-Host "ver3.0  : $Ver3Root (read only)"
 Write-Host "output  : $OutRoot"
+Write-Host "webapi  : $ApiBase"
 
 # ---------------------------------------------------------------- 1. param groups
 Step "1. copy ver3.0 param-group files"
@@ -106,7 +117,7 @@ Write-Host ("  wrote {0} persons / {1} activity rows -> {2}" -f $sample.Count, $
 $cfg = Join-Path $OutRoot "stage0.properties"
 @(
     "outputDir=$($OutRoot.Replace('\','/'))/",
-    "api.baseURL=http://localhost",
+    "api.baseURL=$ApiBase",
     "debug.costLog=true"
 ) | Set-Content -Path $cfg -Encoding ASCII
 $logDir = Join-Path $OutRoot "logs"
