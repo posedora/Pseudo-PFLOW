@@ -13,13 +13,22 @@
       3. build, then run TripGenerator_WebAPI_refactor against the local WebAPI
       4. report time per person and compare representative modes with ver3.0
 
-    All new options (tour.enabled, car.extraCost.*) stay OFF. Only debug.costLog is ON
-    (it writes the cost of every mode; it does not change any decision).
+    By default all new options (tour.enabled, car.extraCost.*) stay OFF (= stage 0).
+    debug.costLog is always ON (it writes the cost of every mode; no decision changes).
+
+    Scenario options (same sample of persons, so the difference is the effect):
+      -Tour            tour.enabled=true (simple round trips decided jointly, car
+                       availability drawn once per person and day)
+      -Parking <yen>   extra car cost once per day for trips to/from Tokyo
+      -DelayPerTrip <yen>  extra car cost per trip to/from Tokyo
+    A scenario writes to C:\okuma\out\trial_<tour|trip>_p<P>_d<D> and the report adds
+    the stage-0 result as a column when it exists.
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\scripts\windows\okuma_stage0_trial.ps1
     powershell -ExecutionPolicy Bypass -File .\scripts\windows\okuma_stage0_trial.ps1 -N 5000
     powershell -ExecutionPolicy Bypass -File .\scripts\windows\okuma_stage0_trial.ps1 -PublicApi
+    powershell -ExecutionPolicy Bypass -File .\scripts\windows\okuma_stage0_trial.ps1 -PublicApi -Tour -Parking 2000 -DelayPerTrip 500
 
     -PublicApi uses the public WebAPI (pflow-api.csis.u-tokyo.ac.jp) instead of the
     local one, and writes to <OutRoot>_public. Keep it to small trials.
@@ -29,17 +38,33 @@ param(
     [int]$Seed = 42,
     [int]$NumThreads = 4,
     [string]$City = "12217",
-    [string]$OutRoot = "C:\okuma\out\stage0_trial",
+    [string]$OutRoot = "",
     [string]$Ver3Root = "C:\Pseudo-PFLOW",
     [switch]$SkipBuild,
-    [switch]$PublicApi
+    [switch]$PublicApi,
+    [switch]$Tour,
+    [double]$Parking = 0,
+    [double]$DelayPerTrip = 0
 )
 
 $ErrorActionPreference = "Stop"
 $ApiBase = "http://localhost"
+$Suffix = ""
 if ($PublicApi) {
     $ApiBase = "https://pflow-api.csis.u-tokyo.ac.jp"
-    $OutRoot = $OutRoot + "_public"
+    $Suffix = "_public"
+}
+$IsScenario = $Tour -or ($Parking -gt 0) -or ($DelayPerTrip -gt 0)
+$Scenario = "stage0"
+if ($IsScenario) {
+    $mode = "trip"
+    if ($Tour) { $mode = "tour" }
+    $Scenario = "{0}_p{1}_d{2}" -f $mode, [int]$Parking, [int]$DelayPerTrip
+}
+$Stage0Root = "C:\okuma\out\stage0_trial" + $Suffix
+if (-not $OutRoot) {
+    if ($IsScenario) { $OutRoot = "C:\okuma\out\trial_" + $Scenario + $Suffix }
+    else { $OutRoot = $Stage0Root }
 }
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $ProjectDir = (Resolve-Path "$ScriptDir\..\..").Path
@@ -62,6 +87,7 @@ Write-Host "project : $ProjectDir"
 Write-Host "ver3.0  : $Ver3Root (read only)"
 Write-Host "output  : $OutRoot"
 Write-Host "webapi  : $ApiBase"
+Write-Host ("scenario: {0} (tour={1}, parking={2}, delayPerTrip={3}, targetPrefs=13)" -f $Scenario, [bool]$Tour, $Parking, $DelayPerTrip)
 
 # ---------------------------------------------------------------- 1. param groups
 Step "1. copy ver3.0 param-group files"
@@ -118,7 +144,11 @@ $cfg = Join-Path $OutRoot "stage0.properties"
 @(
     "outputDir=$($OutRoot.Replace('\','/'))/",
     "api.baseURL=$ApiBase",
-    "debug.costLog=true"
+    "debug.costLog=true",
+    "tour.enabled=$(([bool]$Tour).ToString().ToLower())",
+    "car.extraCost.targetPrefs=13",
+    "car.extraCost.parking=$Parking",
+    "car.extraCost.delayPerTrip=$DelayPerTrip"
 ) | Set-Content -Path $cfg -Encoding ASCII
 $logDir = Join-Path $OutRoot "logs"
 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
@@ -167,20 +197,37 @@ function ModeCounts($path, $pids) {
 }
 $old = ModeCounts $Ver3Trip $sample
 $new = ModeCounts $newTrip $sample
+$s0Trip = Join-Path $Stage0Root "trip\$Pref\trip_$City.csv"
+$hasS0 = $IsScenario -and (Test-Path $s0Trip)
+$s0 = @{}
+if ($hasS0) { $s0 = ModeCounts $s0Trip $sample }
 $label = @{ "0" = "stay"; "1" = "walk"; "2" = "bicycle"; "3" = "car"; "4" = "train"; "5" = "bus"; "6" = "mixed" }
 $oldSum = ($old.Values | Measure-Object -Sum).Sum
 $newSum = ($new.Values | Measure-Object -Sum).Sum
+$s0Sum = 1
+if ($hasS0) { $s0Sum = ($s0.Values | Measure-Object -Sum).Sum }
+function Cell($cnt, $k, $sum) { return ("{0,6} ({1,5:N1}%)" -f [int]$cnt[$k], (100.0 * [int]$cnt[$k] / $sum)) }
 
 $sec = $sw.Elapsed.TotalSeconds
 $out = New-Object System.Collections.Generic.List[string]
 $out.Add(("time: {0:N0} s for {1} persons = {2:N2} s/person ({3} threads)" -f $sec, $sample.Count, ($sec / $sample.Count), $NumThreads))
 $out.Add(("estimate for all {0} Tokyo visitors of {1}: {2:N1} h" -f $tokyo.Count, $City, ($sec / $sample.Count * $tokyo.Count / 3600)))
 $out.Add("")
-$out.Add(("{0,-8} {1,14} {2,14}" -f "mode", "ver3.0", "stage0"))
-foreach ($k in (@($old.Keys) + @($new.Keys) | Sort-Object -Unique)) {
-    $out.Add(("{0,-8} {1,6} ({2,5:N1}%) {3,6} ({4,5:N1}%)" -f $label[$k], [int]$old[$k], (100.0 * [int]$old[$k] / $oldSum), [int]$new[$k], (100.0 * [int]$new[$k] / $newSum)))
+$out.Add("scenario: $Scenario")
+$hdr = "{0,-8} {1,15}" -f "mode", "ver3.0"
+if ($hasS0) { $hdr += " {0,15}" -f "stage0" }
+$hdr += " {0,15}" -f $Scenario
+$out.Add($hdr)
+foreach ($k in (@($old.Keys) + @($new.Keys) + @($s0.Keys) | Sort-Object -Unique)) {
+    $row = "{0,-8} {1}" -f $label[$k], (Cell $old $k $oldSum)
+    if ($hasS0) { $row += " " + (Cell $s0 $k $s0Sum) }
+    $row += " " + (Cell $new $k $newSum)
+    $out.Add($row)
 }
-$out.Add(("{0,-8} {1,14} {2,14}" -f "trips", $oldSum, $newSum))
+$tot = "{0,-8} {1,15}" -f "trips", $oldSum
+if ($hasS0) { $tot += " {0,15}" -f $s0Sum }
+$tot += " {0,15}" -f $newSum
+$out.Add($tot)
 $out | ForEach-Object { Write-Host $_ }
 $out | Set-Content -Path (Join-Path $OutRoot "summary.txt") -Encoding ASCII
 Write-Host ""
